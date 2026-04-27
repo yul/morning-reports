@@ -26,9 +26,12 @@ import logging
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Allow running from the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+load_dotenv()
 
 from lib.edgar_client import EdgarClient, FilingMetadata, ParsedFiling
 
