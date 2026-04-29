@@ -62,14 +62,43 @@ def print_parsed(parsed: ParsedFiling, show_sections: bool = False):
     print(f"\n{'='*70}")
     print(f"  {m.ticker} · {m.form} · filed {m.filing_date} · period {m.period_of_report}")
     print(f"  Accession: {m.accession_number}")
-    print(f"  Sections parsed: {len(parsed.non_empty_sections)} non-empty / {len(parsed.sections)} total")
+    print(f"  Sections: {len(parsed.non_empty_sections)} non-empty / {len(parsed.sections)} total")
     if parsed.parse_errors:
         print(f"  Errors: {parsed.parse_errors}")
 
+    # Always show section names + 100-char extract for validation
+    for sec in parsed.sections:
+        status = "✓" if not sec.is_empty() else "✗"
+        extract = sec.text[:100].replace("\n", " ") if sec.text else "(empty)"
+        print(f"  {status} {sec.item_key:<18} {sec.title[:30]:<30}  {extract!r}")
+
+    # Financials summary — always shown when available
+    fin = parsed.financials
+    if fin:
+        print(f"\n  ── Financials (XBRL)  currency={fin.currency_symbol}")
+        stmts = [
+            ("Income statement", fin.income_statement_md),
+            ("Balance sheet",    fin.balance_sheet_md),
+            ("Cash flow",        fin.cash_flow_md),
+        ]
+        for label, md in stmts:
+            status = "✓" if md else "✗"
+            lines = md.count("\n") + 1 if md else 0
+            print(f"  {status} {label:<20} {lines} rows")
+        # Key metrics
+        m2 = fin.metrics
+        def _fmt(v): return f"{fin.currency_symbol}{v:,.0f}" if isinstance(v, (int, float)) else "n/a"
+        print(f"     revenue={_fmt(m2.get('revenue'))}  "
+              f"net_income={_fmt(m2.get('net_income'))}  "
+              f"op_cash_flow={_fmt(m2.get('operating_cash_flow'))}")
+    else:
+        print("  ✗ Financials (XBRL)  not available")
+
+    # --sections flag adds full 300-char preview of text sections
     if show_sections:
+        print()
         for sec in parsed.non_empty_sections:
             print(f"\n  ── {sec.item_key}: {sec.title}  ({sec.char_count:,} chars)")
-            # Print first 300 chars as preview
             preview = sec.text[:300].replace("\n", " ")
             print(f"     {preview}…")
 

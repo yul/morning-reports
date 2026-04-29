@@ -21,6 +21,7 @@ from lib.edgar_client import (
     EdgarClient,
     FilingMetadata,
     FilingSection,
+    FilingFinancials,
     ParsedFiling,
     TENK_ITEM_TITLES,
     TENQ_ITEM_TITLES,
@@ -116,7 +117,7 @@ class TestFilingSection:
 # ---------------------------------------------------------------------------
 
 class TestParsedFiling:
-    def _make_parsed(self, texts: list[str]) -> ParsedFiling:
+    def _make_parsed(self, texts: list[str], financials=None) -> ParsedFiling:
         meta = FilingMetadata(
             ticker="TEST", company_name="Test Co", cik=99,
             form="10-K", accession_number="0", filing_date=date.today(),
@@ -126,7 +127,7 @@ class TestParsedFiling:
             FilingSection(item_key=f"Item {i}", title=f"Section {i}", text=t)
             for i, t in enumerate(texts, 1)
         ]
-        return ParsedFiling(metadata=meta, sections=sections)
+        return ParsedFiling(metadata=meta, sections=sections, financials=financials)
 
     def test_non_empty_sections_filters_short(self):
         parsed = self._make_parsed(["A" * 200, "tiny", "B" * 300])
@@ -136,6 +137,184 @@ class TestParsedFiling:
         parsed = self._make_parsed(["A" * 200])
         assert parsed.get_section("Item 1") is not None
         assert parsed.get_section("Item 99") is None
+
+    def test_financials_none_by_default(self):
+        parsed = self._make_parsed(["A" * 200])
+        assert parsed.financials is None
+
+    def test_financials_attached(self):
+        fin = FilingFinancials(
+            income_statement_md="| Net Income | 1000 |",
+            balance_sheet_md=None,
+            cash_flow_md=None,
+            metrics={"revenue": 5000, "net_income": 1000},
+        )
+        parsed = self._make_parsed(["A" * 200], financials=fin)
+        assert parsed.financials is not None
+        assert parsed.financials.metrics["revenue"] == 5000
+
+
+# ---------------------------------------------------------------------------
+# FilingSection whitespace stripping
+# ---------------------------------------------------------------------------
+
+class TestFilingSectionWhitespace:
+    def test_trailing_whitespace_stripped_per_line(self):
+        # Simulate wide table padding that edgartools produces
+        raw = "  Products     $294,866     $298,085     \n  Services       96,169       85,200     "
+        sec = FilingSection(item_key="Item 8", title="Financial Statements", text=raw)
+        for line in sec.text.splitlines():
+            assert not line.endswith(" "), f"trailing space on line: {repr(line)}"
+
+    def test_content_preserved_after_strip(self):
+        raw = "  Revenue   $391,035   $383,285   \n  Net Income  $93,736   $96,995   "
+        sec = FilingSection(item_key="Item 7", title="MD&A", text=raw)
+        assert "$391,035" in sec.text
+        assert "$93,736" in sec.text
+
+    def test_char_count_reflects_stripped_text(self):
+        padded = "Hello      "
+        sec = FilingSection(item_key="Item 1", title="Business", text=padded)
+        assert sec.char_count == len("Hello")  # trailing spaces removed
+
+
+# ---------------------------------------------------------------------------
+# FilingFinancials
+# ---------------------------------------------------------------------------
+
+class TestFilingFinancials:
+    def test_defaults(self):
+        fin = FilingFinancials(
+            income_statement_md="| a | b |",
+            balance_sheet_md=None,
+            cash_flow_md=None,
+            metrics={},
+        )
+        assert fin.currency_symbol == "$"
+
+    def test_all_fields_accessible(self):
+        fin = FilingFinancials(
+            income_statement_md="| Net Income | 93,736 |",
+            balance_sheet_md="| Total Assets | 364,980 |",
+            cash_flow_md="| Operating CF | 118,254 |",
+            metrics={
+                "revenue": 391035,
+                "net_income": 93736,
+                "operating_cash_flow": 118254,
+                "free_cash_flow": 87018,
+            },
+            currency_symbol="$",
+        )
+        assert "Net Income" in fin.income_statement_md
+        assert "Total Assets" in fin.balance_sheet_md
+        assert "Operating CF" in fin.cash_flow_md
+        assert fin.metrics["free_cash_flow"] == 87018
+
+
+# ---------------------------------------------------------------------------
+# EdgarClient._extract_financials
+# ---------------------------------------------------------------------------
+
+class TestExtractFinancials:
+    def _client(self) -> EdgarClient:
+        with patch("edgar.set_identity"):
+            return EdgarClient(identity="Test test@test.com")
+
+    def _make_stmt_mock(self, data: dict) -> MagicMock:
+        """Make a mock FinancialStatement that returns a real DataFrame."""
+        import pandas as pd
+        df = pd.DataFrame(data)
+        stmt = MagicMock()
+        stmt.to_numeric.return_value = df
+        return stmt
+
+    def test_returns_none_when_financials_is_none(self):
+        client = self._client()
+        report = MagicMock()
+        report.financials = None
+        errors = []
+        result = client._extract_financials(report, errors)
+        assert result is None
+        assert errors == []
+
+    def test_returns_none_when_financials_raises(self):
+        client = self._client()
+        report = MagicMock()
+        type(report).financials = property(lambda self: (_ for _ in ()).throw(RuntimeError("no xbrl")))
+        errors = []
+        result = client._extract_financials(report, errors)
+        assert result is None
+        assert any("financials" in e for e in errors)
+
+    def test_returns_none_when_all_statements_empty(self):
+        client = self._client()
+        fin = MagicMock()
+        fin.income_statement.return_value = None
+        fin.balance_sheet.return_value = None
+        fin.cash_flow_statement.return_value = None
+        fin.get_financial_metrics.return_value = {}
+        fin.get_currency_symbol.return_value = "$"
+        report = MagicMock()
+        report.financials = fin
+        errors = []
+        result = client._extract_financials(report, errors)
+        assert result is None
+
+    def test_produces_markdown_when_statements_available(self):
+        import pandas as pd
+        client = self._client()
+
+        df = pd.DataFrame(
+            {"2024": [391035.0, 93736.0], "2023": [383285.0, 96995.0]},
+            index=["Total Revenue", "Net Income"]
+        )
+        stmt_mock = MagicMock()
+        stmt_mock.to_numeric.return_value = df
+
+        fin = MagicMock()
+        fin.income_statement.return_value = stmt_mock
+        fin.balance_sheet.return_value = None
+        fin.cash_flow_statement.return_value = None
+        fin.get_financial_metrics.return_value = {"revenue": 391035, "net_income": 93736}
+        fin.get_currency_symbol.return_value = "$"
+
+        report = MagicMock()
+        report.financials = fin
+        errors = []
+        result = client._extract_financials(report, errors)
+
+        assert result is not None
+        assert result.income_statement_md is not None
+        assert "Total Revenue" in result.income_statement_md
+        assert "391,035" in result.income_statement_md
+        assert result.balance_sheet_md is None
+        assert result.metrics["revenue"] == 391035
+        assert result.currency_symbol == "$"
+
+    def test_individual_statement_error_recorded_but_others_continue(self):
+        import pandas as pd
+        client = self._client()
+
+        df = pd.DataFrame({"2024": [100000.0]}, index=["Total Assets"])
+        stmt_mock = MagicMock()
+        stmt_mock.to_numeric.return_value = df
+
+        fin = MagicMock()
+        fin.income_statement.side_effect = RuntimeError("xbrl missing")
+        fin.balance_sheet.return_value = stmt_mock
+        fin.cash_flow_statement.return_value = None
+        fin.get_financial_metrics.return_value = {}
+        fin.get_currency_symbol.return_value = "$"
+
+        report = MagicMock()
+        report.financials = fin
+        errors = []
+        result = client._extract_financials(report, errors)
+
+        assert result is not None
+        assert result.income_statement_md is None   # failed
+        assert result.balance_sheet_md is not None  # succeeded
+        assert any("income_statement" in e for e in errors)
 
 
 # ---------------------------------------------------------------------------

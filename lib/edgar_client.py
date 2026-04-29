@@ -19,6 +19,12 @@ from typing import Generator, Literal, Optional
 import edgar
 from edgar.company_reports import TenK, TenQ
 
+# Only imported for type hints — avoid hard failure if XBRL data is absent
+try:
+    from edgar.entity.statement import FinancialStatement
+except ImportError:
+    FinancialStatement = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -99,10 +105,12 @@ class FilingSection:
     """One parsed section of a 10-K or 10-Q."""
     item_key: str        # e.g. "Item 7" or "Part I, Item 2"
     title: str           # human-readable title
-    text: str            # plain-text content
+    text: str            # plain-text content (trailing whitespace per line stripped)
     char_count: int = field(init=False)
 
     def __post_init__(self):
+        # Strip trailing whitespace from each line — wide tables produce lots of padding
+        self.text = "\n".join(line.rstrip() for line in self.text.splitlines())
         self.char_count = len(self.text)
 
     def is_empty(self) -> bool:
@@ -110,10 +118,33 @@ class FilingSection:
 
 
 @dataclass
+class FilingFinancials:
+    """
+    Structured financial data extracted from XBRL for one filing.
+
+    Sourced from report.financials (not HTML text) so numbers are exact
+    and multi-period comparisons are clean.
+
+    Each statement is a pandas DataFrame (label → period columns) or None
+    if the filing doesn't include that statement / XBRL is unavailable.
+
+    markdown_*  fields are pre-rendered markdown tables ready for embedding.
+    metrics     is a flat dict of the 14 most common KPIs (revenue, net_income, …)
+                with None for any that couldn't be extracted.
+    """
+    income_statement_md: Optional[str]       # markdown table
+    balance_sheet_md: Optional[str]          # markdown table
+    cash_flow_md: Optional[str]              # markdown table
+    metrics: dict                            # flat KPIs: revenue, net_income, …
+    currency_symbol: str = "$"
+
+
+@dataclass
 class ParsedFiling:
     """All sections extracted from one 10-K / 10-Q filing."""
     metadata: FilingMetadata
     sections: list[FilingSection]
+    financials: Optional[FilingFinancials] = None   # None if XBRL unavailable
     parse_errors: list[str] = field(default_factory=list)
 
     @property
@@ -241,11 +272,12 @@ class EdgarClient:
 
     def parse_filing(self, metadata: FilingMetadata) -> ParsedFiling:
         """
-        Download and parse a filing into sections.
+        Download and parse a filing into sections + structured financials.
 
-        Returns a ParsedFiling with one FilingSection per detected item.
-        Sections whose text is shorter than 50 characters are included but
-        flagged via `FilingSection.is_empty()`.
+        Returns a ParsedFiling with:
+        - one FilingSection per detected item (text, trailing whitespace stripped)
+        - a FilingFinancials with XBRL-sourced markdown tables and KPI metrics
+          (financials is None if XBRL data is unavailable for this filing)
         """
         log.info(
             "Parsing %s %s filed %s",
@@ -268,10 +300,17 @@ class EdgarClient:
                 f"(got {type(report).__name__})"
             )
 
+        financials = self._extract_financials(report, errors)
+
         if errors:
             log.warning("%d section errors for %s: %s", len(errors), metadata.accession_number, errors)
 
-        return ParsedFiling(metadata=metadata, sections=sections, parse_errors=errors)
+        return ParsedFiling(
+            metadata=metadata,
+            sections=sections,
+            financials=financials,
+            parse_errors=errors,
+        )
 
     def iter_parsed_filings(
         self,
@@ -356,6 +395,75 @@ class EdgarClient:
                 log.debug("Could not extract %s: %s", item_key, exc)
 
         return sections
+
+    def _extract_financials(self, report, errors: list[str]) -> Optional[FilingFinancials]:
+        """
+        Extract XBRL-based financial statements as markdown tables + flat KPI metrics.
+
+        Falls back gracefully — returns None if the filing has no XBRL data,
+        and skips individual statements that fail without aborting the whole parse.
+
+        Why markdown?  LLMs read markdown tables accurately. Numbers stay bound
+        to their row labels across period columns, unlike the whitespace-aligned
+        text from section.text() which can drift on unusual column widths.
+        """
+        try:
+            fin = report.financials
+            if fin is None:
+                return None
+        except Exception as exc:
+            errors.append(f"financials: {exc}")
+            return None
+
+        def _stmt_to_markdown(getter_name: str) -> Optional[str]:
+            """Call e.g. fin.income_statement() → clean markdown string, or None."""
+            try:
+                stmt = getattr(fin, getter_name)()
+                if stmt is None:
+                    return None
+                df = stmt.to_numeric()
+                if df is None or df.empty:
+                    return None
+                # Format numbers with commas; keep index (row labels)
+                # pandas 2.x renamed applymap → map
+                _map = getattr(df, "map", None) or df.applymap
+                formatted = _map(
+                    lambda v: f"{int(v):,}" if isinstance(v, float) and not __import__('math').isnan(v) else ""
+                )
+                return formatted.to_markdown()
+            except Exception as exc:
+                errors.append(f"{getter_name}: {exc}")
+                return None
+
+        def _get_metrics() -> dict:
+            try:
+                return fin.get_financial_metrics()
+            except Exception as exc:
+                errors.append(f"financial_metrics: {exc}")
+                return {}
+
+        def _get_currency() -> str:
+            try:
+                return fin.get_currency_symbol() or "$"
+            except Exception:
+                return "$"
+
+        income_md = _stmt_to_markdown("income_statement")
+        balance_md = _stmt_to_markdown("balance_sheet")
+        cashflow_md = _stmt_to_markdown("cash_flow_statement")
+
+        # Skip entirely if all three statements failed
+        if income_md is None and balance_md is None and cashflow_md is None:
+            log.debug("All XBRL statements empty/missing, skipping financials")
+            return None
+
+        return FilingFinancials(
+            income_statement_md=income_md,
+            balance_sheet_md=balance_md,
+            cash_flow_md=cashflow_md,
+            metrics=_get_metrics(),
+            currency_symbol=_get_currency(),
+        )
 
 
 # ---------------------------------------------------------------------------
